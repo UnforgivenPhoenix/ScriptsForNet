@@ -1,0 +1,226 @@
+#!/usr/bin/expect -f
+#exp_internal 1
+
+set params  [lindex $argv 0]
+set hwpswd  [lindex $argv 1]
+set junpswd [lindex $argv 2]
+set ftpswd  [lindex $argv 3]
+set ftpip 192.168.100.18
+set ftpuser user
+set zabbixsrv 192.168.100.14
+set snmpcompname MFR_SNMP_community
+set snmplocation "Samara, MFR DataCenter"
+set snmpcontact "snmp.service@megafon-retail.ru"
+set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
+set mail unforgiven.phoenix@gmail.com
+# перезаписываем файл отчета
+set log [open ./report w+]
+set timeout 10
+
+# log_file -noappend temp.log
+# set prompt "#|%|>|\\\$ $"
+
+# проверка наполнения аргументов
+if { ([string length $params] > 0) && ([string length $hwpswd] > 0) && ([string length $junpswd] > 0) && ([string length $ftpswd] > 0) } {
+   # проверка наличия файла с перечнем устройств
+   if {[file exists ./switch_ip_list]} {
+      puts "Switch IP file found"
+      # вычисление количества строй в перечне устройств
+      set cntlines [exec wc -l < ./switch_ip_list]
+      set ufile [open "./switch_ip_list" r]
+      set spswlist [split [read $ufile] "\n"]
+      set opercnt 0
+      # цикл на количество проходов по количеству строк в списке оборудования
+      while {$opercnt <= $cntlines} {
+         # проверка на наличие данных в списке
+         if { [lindex $spswlist 0] > 0 } {
+            # основной исполняемый цикл перебора строк их списка оборудования
+            foreach uline $spswlist  {
+               set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
+               # проверка на наличие данных в строке списка
+               if {[string length $uline] > 0} {
+                  set swip    [lindex $uline 0]
+                  set swlogin [lindex $uline 1]
+                  # проверка переменных swip и swlogin на заполнение
+                  if { ([string length $swip] > 0) && ([string length $swlogin] > 0)} {
+                     puts "Switch IP $swip & login added"
+                     # подключение через ssh с использованием установленного метода обмена ключами (без явного указания наш хуавей не хочет дружить)
+                     # spawn ssh -oKexAlgorithms=+diffie-hellman-group-exchange-sha1 $swlogin@$swip (альтернативный вариант)
+                     spawn ssh -oKexAlgorithms=+diffie-hellman-group14-sha1 $swlogin@$swip
+                     sleep 4               
+                     set opercnt [expr $opercnt + 1 ]
+                     expect {
+                        # переход к следующему IP из списка по отсутствию доступа к хосту или неверному паролю или переход дальше в случае успешной авторизации
+                        "*o route to host*" { puts "Host $swip not found"; expect eof; close $spawn_id; puts $log "$date: Operation $opercnt on Switch $swip NOT complete becouse Host Unreachable"; continue }
+                        "*ermission denied*" { puts "For host $swip password is wrong"; expect eof; close $spawn_id; puts $log "$date: Operation $opercnt on Switch $swip NOT complete becouse Wrong Password"; continue }
+                        "*yes/no*" {send "yes\r"; exp_continue}
+                        "*assword" {
+                           # счетчик неудачных попыток атовризации - смена пароля по первой и уход в начало цикла по второй неверной попытке авторизоваться
+                           if {[incr fails] == 1} {
+                              send "$junpswd\r"
+                              exp_continue
+                           } elseif {[incr fails] == 2} {
+                              set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
+                              puts "For host $swip password is wrong"; expect eof; close $spawn_id; puts $log "$date: Operation $opercnt on Switch $swip NOT complete becouse Password is Wrong"; continue
+                           } else {
+                              send "$hwpswd\r"
+                              exp_continue
+                           }
+                        }
+                     }
+                     expect {
+                        # цикл на приглашениехуавея, у джуна первое приглашение отличатся...
+                        "*>" {
+                           send "display version\r"
+                           expect {
+                              "*Huawei*" {
+                                 send "system-view\r"
+                                 } timeout {
+                                    set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
+                                    send "exit\r"; expect eof; close $spawn_id; puts $log "$date: Operation $opercnt on Switch $swip becouse Host Not Recognized"; continue
+                                 }
+                     }
+                     if {[regexp -nocase s $params match]} {
+                        # acl rules for SNMP access
+                        expect "*]" {send "acl 2100\r"}
+                        expect "*]" {send "rule permit source $zabbixsrv 0.0.0.0\r"}
+                        # expect "*]" {send "rule permit source 192.168.100.0 0.0.0.255r"} правило для указания подсети вместо конкрентого IP
+                        expect "*]" {send "rule deny\r"}
+                        expect "*]" {send "quit\r"}
+                        # включаем SNMP для мониторинга из Zabbix
+                        expect "*]" {send "snmp-agent sys-info version v2c\r"}
+                        expect "*]" {send "snmp-agent community read $snmpcompname acl 2100\r"}
+                        expect "*]" {send "snmp-agent sys-info contact $snmpcontact\r"}
+                        expect "*]" {send "snmp-agent sys-info location $snmplocation\r"}
+                        expect "*]" {send "set save-configuration\r"}
+                        sleep 1
+                        set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
+                        puts $log "$date: SNMP on $swip configurated"
+                     }
+                     if {[regexp -nocase a $params match]} { 
+                        # переделать на 10080 / 60 после окончания тестирования функции
+                        expect "*]" {send "set save-configuration interval 10080 delay 60\r"}
+                        expect "*]" {send "set save-configuration backup-to-server server $ftpip transport-type ftp user $ftpuser password $ftpswd path upload\r"}
+                        sleep 1
+                        set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
+                        puts $log "$date: Auto-config-backup on $swip configurated"
+                     }
+                     if {[regexp -nocase m $params match]} {
+                        # мануальная передача конфига на FTP
+                        expect "*]" {send "quit\r"}
+                        expect "*>" {send "save $swip.cfg\r"}
+                        sleep 5
+                        expect "*Y/N*" {send "yes\r"}
+                        sleep 2
+                        expect "*>" {send "FTP $ftpip\r"}
+                        sleep 1
+                        expect "*ser*" {send "$ftpuser\r"}
+                        expect "*assword*" {send "$ftpswd\r"}
+                        expect "*ftp*" {send "cd /upload/\r"}
+                        expect "*ftp*" {send "binary\r"}
+                        expect "*ftp*" {send "put $swip.cfg\r"}
+                        sleep 10
+                        expect "*Failed*" {send "put $swip.cfg\r"}
+                        expect "*ftp*" {send "dir\r"}
+                        expect "*ftp*" {send "quit\r"}
+                        expect "*>" {send "quit\r"}
+                        expect eof
+                        close $spawn_id
+                        set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
+                        puts $log "$date: Manual-config-backup on $swip executed"
+                     }
+                     puts $log "$date: All requested operations at block #$opercnt on Switch $swip complete"
+                     sleep 1
+                  }
+                  # цикл на приглашение джунипера
+                  "*%" {
+                     send "cli\r"
+                     expect "*>" {send "show version\r\r\r"}
+                           sleep 1
+                           send "\r"
+                           sleep 1
+                           expect {
+                              "*JUNOS*" {
+                              send "edit\r"
+                           } timeout {
+                              set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
+                              send send "exit\r"; expect eof; close $spawn_id; puts $log "$date: Operation $opercnt on Switch $swip becouse Host Not Recognized"; continue
+                           }
+                     }
+                     if {[regexp -nocase s $params match]} {
+                        # включаем SNMP для мониторинга из Zabbix
+                        expect "*#" {send "set snmp name \"$swip\"\r"}
+                        expect "*#" {send "set snmp description \"$swip-juniper-switch\"\r"}
+                        expect "*#" {send "set snmp location $snmplocation\r"}
+                        expect "*#" {send "set snmp contact $snmpcontact\r"}
+                        expect "*#" {send "set snmp community $snmpcompname authorization read-only\r"}
+                        expect "*#" {send "set snmp client-list list0 $zabbixsrv\r"}
+                        expect "*#" {send "set snmp community MFR client-list-name list0\r"}
+                        expect "*#" {send "commit\r"}
+                        sleep 10
+                        set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
+                        puts $log "$date: SNMP on $swip configurated"
+                     }
+                     if {[regexp -nocase m $params match]} {
+                        # мануальная передача конфига на FTP
+                        expect "*#" {send "save ftp://$ftpuser:$ftpswd@$ftpip/upload/$swip.conf\r"}
+                        sleep 10
+                        puts "Manual-config-backup on $swip executed"
+                        set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
+                        puts $log "$date: Manual-config-backup on $swip executed"
+                     }
+                     if {[regexp -nocase a $params match]} {
+                        # включаем и настраиваем автоматический бэкап на FTP переделать на 604800 (weekly) после окончания тестирования функции
+                        expect "*#" {send "set event-options generate-event config-archival-event time-interval 604800\r"}
+                        expect "*#" {send "set event-options policy config-archive-policy events config-archival-event\r"}
+                        expect "*#" {send "set event-options policy config-archive-policy then upload filename /config/juniper.conf.gz destination conFTP\r"}
+                        expect "*#" {send "set event-options destinations conFTP archive-sites \"ftp://$ftpuser@$ftpip/upload\" password \"$ftpswd\"\r"}
+                        expect "*#" {send "commit\r"}
+                        sleep 10
+                        expect "*#" {send "quit\r"}
+                        expect "*>" {send "quit\r"}
+                        close $spawn_id
+                        sleep 1
+                        set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
+                        puts $log "$date: Auto-config-backup on $swip configurated"
+                     }
+                     set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
+                     puts $log "$date: All requested operations at block #$opercnt on Switch $swip complete"
+                  }
+               }
+               } else {
+                  puts "Switch IP file syntax incorrect or list is OVER"
+                  puts $log "$date: Switch IP file syntax incorrect or list is OVER"
+                  close $log
+                  exit 1
+                  }
+            } else {
+               puts "END of LIST"
+               puts $log "$date: END of LIST. Total operations performed: $opercnt"
+               close $log
+               exec cat ./report | mail -a "From: SwitchService <myprivateownmailservice@gmail.com>" -a "Subject: $date service report" $mail
+               exit 1
+            }
+         }
+      } else {
+         puts "Switch IP file is EMPTY"
+         puts $log "$date: Switch IP file is EMPTY"
+         close $log
+         exit 1
+         }
+         }
+   # puts "ALL ( $cntlines ) operations completed"
+   } else { 
+      puts "Switch IP file NOT found"
+      puts $log "$date: Switch IP file NOT found"
+      close $log
+      exit 1
+      }
+} else {
+   puts "Parameters or credentials on script arguments NOT found.\r
+   Add script parameters on 1st script argument (m - manual backup, a- auto backup, s- snmp configuration.\r
+   Add switch and ftp passwords on script arguments (2nd - huawei password, 3rd - juniper password, 4th - FTP password) 
+   Example: ./scriptname mas huaweipass juniperpass ftppass"
+   exit 1
+}
+exit 0
