@@ -1,41 +1,68 @@
 #!/usr/bin/expect -f
 #exp_internal 1
 
+# log_file -noappend temp.log
+# set prompt "#|%|>|\\\$ $"
+
 set params  [lindex $argv 0]
-set hwpswd  [lindex $argv 1]
-set junpswd [lindex $argv 2]
-set ftpswd  [lindex $argv 3]
+set swpswd  [lindex $argv 1]
+set ftpswd  [lindex $argv 2]
 set ftpip 192.168.100.18
 set ftpuser user
 set zabbixsrv 192.168.100.14
 set snmpcompname MFR_SNMP_community
-set snmplocation "Samara, MFR DataCenter"
-set snmpcontact "snmp.service@megafon-retail.ru"
+set snmplocation Samara_MFR_DataCenter
+set snmpcontact snmp.service@megafon-retail.ru
 set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
 set mail unforgiven.phoenix@gmail.com
 # перезаписываем файл отчета
 set log [open ./report w+]
 set timeout 10
 
-# log_file -noappend temp.log
-# set prompt "#|%|>|\\\$ $"
-
 # проверка наполнения аргументов
-if { ([string length $params] > 0) && ([string length $hwpswd] > 0) && ([string length $junpswd] > 0) && ([string length $ftpswd] > 0) } {
+if { ([string length $params] > 0) && ([string length $swpswd] > 0) && ([string length $ftpswd] > 0) } {
    # проверка наличия файла с перечнем устройств
    if {[file exists ./switch_ip_list]} {
       puts "Switch IP file found"
-      # вычисление количества строй в перечне устройств
+   # ftp access test
+   if { [regexp -nocase m $params match] } {
+   set testftp 0
+   spawn ftp $ftpip
+   sleep 4
+   expect "*ame" {send "user\r"}
+   expect "*assword" {send "$ftpswd\r"}
+   expect {
+      "*o route to host*" {puts "FTP server not found"}
+      "*failed*" {puts "Wrong FTP credentials"}
+      "*uccessful*" {set testftp 1}
+   }
+   sleep 1 
+   expect "*ftp>*" {send "quit\r"}
+   if {$testftp == 1} {puts "FTP available"
+   } else {
+    puts $log "$date: Attention: FTP is not awailable or Bad credentials. Operations with manual-config-FTP-transfer was NOT executed
+    "}
+   }
+      # форматируем перечень устройств - удаляем пустые строки для корректного подсчета 
+      set ufile [open "./switch_ip_list" r]
+      set swlist [read $ufile]
+      close $ufile
+      regsub -all -line {(?:^[ \t]*)(?:\n|\Z)} $swlist "" swlist
+      set ufile [open "./switch_ip_list" w]
+      puts -nonewline $ufile $swlist
+      close $ufile
+      # вычисление количества записей в перечне устройств
       set cntlines [exec wc -l < ./switch_ip_list]
       set ufile [open "./switch_ip_list" r]
       set spswlist [split [read $ufile] "\n"]
       set opercnt 0
-      # цикл на количество проходов по количеству строк в списке оборудования
+      # цикл на количество проходов по количеству строк в списке устройств
       while {$opercnt <= $cntlines} {
          # проверка на наличие данных в списке
          if { [lindex $spswlist 0] > 0 } {
-            # основной исполняемый цикл перебора строк их списка оборудования
+            # основной исполняемый цикл перебора строк из списка устройств
             foreach uline $spswlist  {
+               global spawn_id timeout
                set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
                # проверка на наличие данных в строке списка
                if {[string length $uline] > 0} {
@@ -47,26 +74,16 @@ if { ([string length $params] > 0) && ([string length $hwpswd] > 0) && ([string 
                      # подключение через ssh с использованием установленного метода обмена ключами (без явного указания наш хуавей не хочет дружить)
                      # spawn ssh -oKexAlgorithms=+diffie-hellman-group-exchange-sha1 $swlogin@$swip (альтернативный вариант)
                      spawn ssh -oKexAlgorithms=+diffie-hellman-group14-sha1 $swlogin@$swip
-                     sleep 4               
+                     sleep 3               
                      set opercnt [expr $opercnt + 1 ]
                      expect {
                         # переход к следующему IP из списка по отсутствию доступа к хосту или неверному паролю или переход дальше в случае успешной авторизации
-                        "*o route to host*" { puts "Host $swip not found"; expect eof; close $spawn_id; puts $log "$date: Operation $opercnt on Switch $swip NOT complete becouse Host Unreachable"; continue }
-                        "*ermission denied*" { puts "For host $swip password is wrong"; expect eof; close $spawn_id; puts $log "$date: Operation $opercnt on Switch $swip NOT complete becouse Wrong Password"; continue }
+                        "*o route to host*" { puts "Host $swip not found"; puts $log "$date: Operation block # $opercnt on Switch $swip NOT complete becouse Host Unreachable"; continue }
+                        "*ermission denied*" { puts "For host $swip password is wrong"; puts $log "$date: Operation block # $opercnt on Switch $swip NOT complete becouse Wrong Password"; continue }
                         "*yes/no*" {send "yes\r"; exp_continue}
-                        "*assword" {
-                           # счетчик неудачных попыток атовризации - смена пароля по первой и уход в начало цикла по второй неверной попытке авторизоваться
-                           if {[incr fails] == 1} {
-                              send "$junpswd\r"
-                              exp_continue
-                           } elseif {[incr fails] == 2} {
-                              set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
-                              puts "For host $swip password is wrong"; expect eof; close $spawn_id; puts $log "$date: Operation $opercnt on Switch $swip NOT complete becouse Password is Wrong"; continue
-                           } else {
-                              send "$hwpswd\r"
-                              exp_continue
-                           }
-                        }
+                        "*isconnect*" { puts "For host $swip password is wrong"; puts $log "$date: Operation block # $opercnt on Switch $swip NOT complete becouse Wrong Password"; continue }
+                        # timeout { puts "Host $swip not found"; expect eof; close $spawn_id; puts $log "$date: Operation $opercnt on Switch $swip NOT complete becouse Host Unreachable"; continue }
+                        "*assword" {send "$swpswd\r"; exp_continue}
                      }
                      expect {
                         # цикл на приглашениехуавея, у джуна первое приглашение отличатся...
@@ -105,7 +122,7 @@ if { ([string length $params] > 0) && ([string length $hwpswd] > 0) && ([string 
                         set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
                         puts $log "$date: Auto-config-backup on $swip configurated"
                      }
-                     if {[regexp -nocase m $params match]} {
+                     if { ([regexp -nocase m $params match]) && ($testftp == "1") } {
                         # мануальная передача конфига на FTP
                         expect "*]" {send "quit\r"}
                         expect "*>" {send "save $swip.cfg\r"}
@@ -113,14 +130,21 @@ if { ([string length $params] > 0) && ([string length $hwpswd] > 0) && ([string 
                         expect "*Y/N*" {send "yes\r"}
                         sleep 2
                         expect "*>" {send "FTP $ftpip\r"}
-                        sleep 1
-                        expect "*ser*" {send "$ftpuser\r"}
-                        expect "*assword*" {send "$ftpswd\r"}
-                        expect "*ftp*" {send "cd /upload/\r"}
+                        sleep 5
+                        expect {
+                           "*ailed*" { puts "FTP server $ftpip not found"; expect eof; close $spawn_id; puts $log "$date: Operation $opercnt on Switch $swip NOT complete becouse FTP Not Found"; continue }
+                           "*ser*" {send "$ftpuser\r"}
+                           timeout { puts "FTP server $ftpip not found"; expect eof; close $spawn_id; puts $log "$date: Operation $opercnt on Switch $swip NOT complete becouse FTP Not Found"; continue } 
+                        }
+                        expect "*assword*" {send "$ftpswd\r"}                                             
+                        expect {
+                           "*incorrect" { puts "FTP $ftpip Credentials is wrong"; expect eof; close $spawn_id; puts $log "$date: Operation $opercnt on Switch $swip NOT complete becouse Wrong FTP Login/Password"; continue }
+                           "*ftp*" {send "cd /upload/\r"}
+                        }
                         expect "*ftp*" {send "binary\r"}
                         expect "*ftp*" {send "put $swip.cfg\r"}
                         sleep 10
-                        expect "*Failed*" {send "put $swip.cfg\r"}
+                        expect "*Failed*" { set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]; puts "FTP $ftpip Credentials is wrong or transfer error"; puts $log "$date: Manual-config-backup on Switch $swip NOT complete becouse Transfer protocol error" } 
                         expect "*ftp*" {send "dir\r"}
                         expect "*ftp*" {send "quit\r"}
                         expect "*>" {send "quit\r"}
@@ -135,10 +159,10 @@ if { ([string length $params] > 0) && ([string length $hwpswd] > 0) && ([string 
                   # цикл на приглашение джунипера
                   "*%" {
                      send "cli\r"
-                     expect "*>" {send "show version\r\r\r"}
+                     expect "*>" {send "show version\r"}
                            sleep 1
-                           send "\r"
-                           sleep 1
+                           send -- { }
+                           send -- { }
                            expect {
                               "*JUNOS*" {
                               send "edit\r"
@@ -161,29 +185,30 @@ if { ([string length $params] > 0) && ([string length $hwpswd] > 0) && ([string 
                         set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
                         puts $log "$date: SNMP on $swip configurated"
                      }
-                     if {[regexp -nocase m $params match]} {
-                        # мануальная передача конфига на FTP
-                        expect "*#" {send "save ftp://$ftpuser:$ftpswd@$ftpip/upload/$swip.conf\r"}
-                        sleep 10
-                        puts "Manual-config-backup on $swip executed"
-                        set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
-                        puts $log "$date: Manual-config-backup on $swip executed"
-                     }
                      if {[regexp -nocase a $params match]} {
-                        # включаем и настраиваем автоматический бэкап на FTP переделать на 604800 (weekly) после окончания тестирования функции
+                        # включаем и настраиваем автоматический бэкап на FTP (установлен недельный период)
                         expect "*#" {send "set event-options generate-event config-archival-event time-interval 604800\r"}
                         expect "*#" {send "set event-options policy config-archive-policy events config-archival-event\r"}
                         expect "*#" {send "set event-options policy config-archive-policy then upload filename /config/juniper.conf.gz destination conFTP\r"}
                         expect "*#" {send "set event-options destinations conFTP archive-sites \"ftp://$ftpuser@$ftpip/upload\" password \"$ftpswd\"\r"}
                         expect "*#" {send "commit\r"}
                         sleep 10
-                        expect "*#" {send "quit\r"}
-                        expect "*>" {send "quit\r"}
-                        close $spawn_id
-                        sleep 1
                         set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
                         puts $log "$date: Auto-config-backup on $swip configurated"
                      }
+                     if { ([regexp -nocase m $params match]) && ($testftp == "1") } {
+                        # мануальная передача конфига на FTP
+                        expect "*#" {send "save ftp://$ftpuser:$ftpswd@$ftpip/upload/$swip.conf\r"}
+                        sleep 4
+                        expect {
+                           "*Wrote*" { puts "Manual-config-backup on $swip executed"; set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]; puts $log "$date: Manual-config-backup on $swip executed"; }
+                           "*Error*" { set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]; puts "FTP $ftpip Credentials is wrong or transfer error"; puts $log "$date: Manual-config-backup on Switch $swip NOT complete becouse Transfer protocol error" } 
+                           timeout { puts "FTP server $ftpip not found"; puts $log "$date: Operation $opercnt on Switch $swip NOT complete becouse FTP Not Found" }
+                        }
+                     }
+                     expect "*#" {send "quit\r"}
+                     expect "*>" {send "quit\r"}
+                     close $spawn_id
                      set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}]
                      puts $log "$date: All requested operations at block #$opercnt on Switch $swip complete"
                   }
@@ -195,12 +220,15 @@ if { ([string length $params] > 0) && ([string length $hwpswd] > 0) && ([string 
                   exit 1
                   }
             } else {
-               puts "END of LIST"
-               puts $log "$date: END of LIST. Total operations performed: $opercnt"
+               puts "
+               END of LIST"
+               puts $log "
+               $date: END of LIST. Total operation blocks performed: $opercnt"
                close $log
                exec cat ./report | mail -a "From: SwitchService <myprivateownmailservice@gmail.com>" -a "Subject: $date service report" $mail
                exit 1
             }
+            # puts "end of cycle"; expect eof; close $spawn_id; puts $log "$date: End of cycle $opercnt on Switch $swip"
          }
       } else {
          puts "Switch IP file is EMPTY"
@@ -208,19 +236,33 @@ if { ([string length $params] > 0) && ([string length $hwpswd] > 0) && ([string 
          close $log
          exit 1
          }
-         }
-   # puts "ALL ( $cntlines ) operations completed"
+      }
    } else { 
-      puts "Switch IP file NOT found"
+      puts "
+      *********************************************************
+      *   Switch IP file NOT found                            *
+      *   Add file named switch_ip_list on script's directory *
+      *   File syntax sould be like:                          *
+      *   switch1_ip switch1_login                            *
+      *   switch2_ip switch2_login                            *
+      *   example:                                            *
+      *   192.168.0.1 user                                    *
+      *   192.168.0.2 admin                                   *
+      *********************************************************   
+         "
       puts $log "$date: Switch IP file NOT found"
       close $log
       exit 1
       }
 } else {
-   puts "Parameters or credentials on script arguments NOT found.\r
-   Add script parameters on 1st script argument (m - manual backup, a- auto backup, s- snmp configuration.\r
-   Add switch and ftp passwords on script arguments (2nd - huawei password, 3rd - juniper password, 4th - FTP password) 
-   Example: ./scriptname mas huaweipass juniperpass ftppass"
+   puts "
+   ************************************************************************************************************
+   *  Parameters or credentials on script arguments NOT found.                                                *
+   *  Add script parameters on 1st script argument (m - manual backup, a- auto backup, s- snmp configuration) *
+   *  Add switch and ftp passwords on 2nd & 3rd script arguments (2nd - switch password, 3rd - FTP password)            *
+   *  Example: ./scriptname mas huaweipass ftppass                                                            *
+   ************************************************************************************************************
+   "
    exit 1
 }
 exit 0
